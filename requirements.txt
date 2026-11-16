@@ -1,6 +1,5 @@
-anthropic>=0.40
-fastapi
+mcp>=2.3,<3
 uvicorn
 numpy
-# optional, better recall (downloads a ~470MB model on first run):
+# optional, semantic matching (downloads a model on first run):
 # sentence-transformers

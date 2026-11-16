@@ -13,7 +13,8 @@ class HashEmbedder:
     """Bag of character 1-3 grams hashed into a fixed vector. Crude but works
     offline for Chinese and English; good enough to prove the pipeline."""
 
-    related_threshold = 0.55  # similarity above which another topic counts as "related"
+    # lexical overlap only, so the bar is low; Claude reads the topic index for the semantics
+    recall_floor = 0.05
 
     def __init__(self, dim: int = 1024):
         self.dim = dim
@@ -34,8 +35,8 @@ class HashEmbedder:
 class STEmbedder:
     """sentence-transformers model, e.g. intfloat/multilingual-e5-small."""
 
-    # e5-style models score almost everything 0.7+, so "related" needs a high bar
-    related_threshold = 0.86
+    # e5-style models score almost everything 0.7+, so the floor sits higher
+    recall_floor = 0.8
 
     def __init__(self, model_name: str):
         from sentence_transformers import SentenceTransformer  # lazy import
@@ -49,7 +50,7 @@ class STEmbedder:
 
 
 def make_embedder():
-    name = os.environ.get("EMBED_MODEL", "intfloat/multilingual-e5-small")
+    name = os.environ.get("EMBED_MODEL", "hash")
     if name == "hash":
         return HashEmbedder()
     try:

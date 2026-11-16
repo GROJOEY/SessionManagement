@@ -1,119 +1,202 @@
-"""FastAPI app: one chat box, topics filed automatically.
+"""OneThread: a lightweight MCP memory server.
 
-Run:  ANTHROPIC_API_KEY=... uvicorn onethread.server:app --reload
-      ONETHREAD_MOCK=1 uvicorn onethread.server:app   (no key, scripted replies)
+You keep one conversation with Claude and talk about anything. Claude files what matters
+under topics it picks itself, and pulls the right topic back in the next time it comes up.
+The server only stores and searches; all the judgment (which topic, what to keep, how to
+summarize) is done by the Claude you are already talking to, so no API key is needed.
+
+Run:
+  python -m onethread.server              # remote, http://localhost:8000/mcp
+  python -m onethread.server --stdio      # local, for Claude Desktop / Claude Code
+Env:
+  ONETHREAD_DB   SQLite file (default ./data/onethread.db)
+  EMBED_MODEL    'hash' (default, no download) or a sentence-transformers model
+  AUTH_TOKEN     if set, the remote URL must carry ?token=<value>
+  PORT           default 8000
 """
 
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
+import sys
+from datetime import datetime
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from mcp.server.mcpserver import MCPServer
+from mcp_types import ToolAnnotations
+from starlette.responses import JSONResponse
 
-from .db import DB
-from .embed import HashEmbedder, make_embedder
-from .engine import Engine
-from .llm import ClaudeLLM, MockLLM
+from .embed import make_embedder
+from .store import Store
 
-MOCK = os.environ.get("ONETHREAD_MOCK") == "1"
-db = DB(os.environ.get("ONETHREAD_DB", "data/onethread.db"))
-engine = Engine(db, MockLLM() if MOCK else ClaudeLLM(),
-                HashEmbedder() if MOCK else make_embedder())
+SUMMARY_EVERY = 5  # ask Claude to refresh a topic summary after this many new notes
 
-STATIC = Path(__file__).resolve().parent.parent / "static"
-app = FastAPI(title="OneThread")
-app.mount("/static", StaticFiles(directory=STATIC), name="static")
+store = Store(os.environ.get("ONETHREAD_DB", "./data/onethread.db"), make_embedder())
 
-
-class ChatIn(BaseModel):
-    text: str
-
-
-class MoveIn(BaseModel):
-    topic_id: int | None = None
-    new_topic: str | None = None
-
-
-class TopicPatch(BaseModel):
-    name: str | None = None
-    summary: str | None = None
+mcp = MCPServer(
+    name="onethread",
+    version="0.2.0",
+    instructions=(
+        "OneThread is the user's long-term memory, organized by topic. The user talks about "
+        "everything in one conversation and never says which topic they mean; you keep track.\n"
+        "1. At the start of EVERY user message, before answering, call `recall` with the message. "
+        "Use what comes back naturally, like a friend who remembers; don't announce that you looked it up.\n"
+        "2. After answering, if the message contained something worth remembering (a fact, decision, "
+        "plan, preference, progress, open question), call `remember` once per topic it touches. "
+        "Pick an existing topic when one fits; otherwise create a short, recognizable one (2–8 words). "
+        "Store the gist in one or two sentences, not the raw message. Skip small talk.\n"
+        "3. When `remember` reports the summary is stale, call `update_summary` with a rewritten summary "
+        "(facts, decisions, plans, open questions; newest wins on conflicts; under 120 words).\n"
+        "4. Never ask the user which topic something belongs to. If they say something was filed wrong, "
+        "fix it with `move_note` or `merge_topics`."
+    ),
+)
 
 
-def topic_dict(t):
-    return {"id": t.id, "name": t.name, "summary": t.summary,
-            "updated_at": t.updated_at, "segment_count": t.segment_count}
+def _when(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
 
 
-@app.get("/")
-def index():
-    return FileResponse(STATIC / "index.html")
+@mcp.tool(title="Recall memory", annotations=ToolAnnotations(readOnlyHint=True))
+def recall(message: str) -> str:
+    """Call at the start of every user message. Returns (1) the topics whose notes best match the
+    message, with summary and notes, and (2) an index of every other topic with a one-line summary.
+    The matching is rough: read the index yourself, and if a topic there is relevant, call
+    get_topic for it before answering.
+
+    Args:
+        message: the user's latest message, verbatim
+    """
+    hits = store.recall(message)
+    lines = []
+    if hits:
+        for h in hits:
+            t = h["topic"]
+            lines.append(f"## {t.name}  (match {h['score']})")
+            lines.append(f"Summary: {t.summary or '(none yet)'}")
+            for n in h["notes"]:
+                lines.append(f"- [{n.id}] {_when(n.created_at)}: {n.content}")
+            lines.append("")
+    shown = {h["topic"].id for h in hits}
+    others = [t for t in store.list_topics() if t.id not in shown]
+    if others:
+        lines.append("## Other topics (call get_topic if one is relevant)")
+        for t in others[:40]:
+            gist = (t.summary or (store.topic_notes(t.id)[-1].content if t.note_count else ""))[:80]
+            lines.append(f"- {t.name}: {gist}")
+    if not lines:
+        return "No memory yet. Anything worth keeping from this message starts a new topic."
+    return "\n".join(lines).strip()
 
 
-@app.post("/api/chat")
-def chat(body: ChatIn, background: BackgroundTasks):
-    text = body.text.strip()
-    if not text:
-        raise HTTPException(400, "empty message")
-    result = engine.handle(text)
-    background.add_task(engine.update_summaries, result)
-    return {
-        "user_message_id": result.user_message_id,
-        "assistant_message_id": result.assistant_message_id,
-        "segments": [s.__dict__ for s in result.segments],
-        "related": result.related,
-        "reply": result.reply,
-    }
+@mcp.tool(title="Remember")
+def remember(topic: str, content: str) -> str:
+    """File one piece of information under a topic. The topic is created if it doesn't exist
+    (names match case-insensitively). Call once per topic a message touches.
+
+    Args:
+        topic: an existing topic name, or a short new one (2-8 words)
+        content: the gist in one or two sentences, written so it makes sense later on its own
+    """
+    t, note, created = store.add_note(topic, content)
+    msg = f"Saved note [{note.id}] under '{t.name}'" + (" (new topic)" if created else "") + "."
+    if t.notes_since_summary >= SUMMARY_EVERY or (created and not t.summary):
+        msg += f" The summary of '{t.name}' is stale: call update_summary for it."
+    return msg
 
 
-@app.get("/api/messages")
-def messages():
-    out = []
-    for m in db.all_messages():
-        segs = db.message_segments(m["id"]) if m["role"] == "user" else []
-        out.append({
-            "id": m["id"], "role": m["role"], "content": m["content"],
-            "topic_ids": json.loads(m["topic_ids"]),
-            "segments": [{"id": s.id, "text": s.text, "topic_id": s.topic_id,
-                          "topic_name": db.get_topic(s.topic_id).name,
-                          "corrected": s.corrected} for s in segs],
-        })
-    return out
+@mcp.tool(title="Update topic summary")
+def update_summary(topic: str, summary: str) -> str:
+    """Replace a topic's running summary. Write it from the old summary plus the newer notes
+    (use get_topic if you need them): facts, decisions, plans, open questions; newest wins.
+
+    Args:
+        topic: topic name
+        summary: the new summary, under 120 words
+    """
+    t = store.set_summary(topic, summary)
+    return f"Updated summary of '{t.name}'." if t else f"No topic named '{topic}'."
 
 
-@app.get("/api/topics")
-def topics():
-    return [topic_dict(t) for t in db.list_topics()]
+@mcp.tool(title="List topics", annotations=ToolAnnotations(readOnlyHint=True))
+def list_topics() -> str:
+    """List every topic with its note count and summary, most recently active first."""
+    ts = store.list_topics()
+    if not ts:
+        return "No topics yet."
+    return "\n".join(f"- {t.name} ({t.note_count} notes, active {_when(t.updated_at)}): "
+                     f"{t.summary or '(no summary yet)'}" for t in ts)
 
 
-@app.get("/api/topics/{topic_id}")
-def topic(topic_id: int):
-    t = db.get_topic(topic_id)
+@mcp.tool(title="Get topic", annotations=ToolAnnotations(readOnlyHint=True))
+def get_topic(topic: str) -> str:
+    """Show one topic in full: summary and every note with its id.
+
+    Args:
+        topic: topic name
+    """
+    t = store.get_topic(topic)
     if not t:
-        raise HTTPException(404, "no such topic")
-    segs = [{"id": s.id, "role": s.role, "text": s.text, "created_at": s.created_at}
-            for s in db.topic_segments(topic_id)]
-    return {**topic_dict(t), "segments": segs}
+        return f"No topic named '{topic}'. Topics: " + ", ".join(x.name for x in store.list_topics())
+    notes = "\n".join(f"- [{n.id}] {_when(n.created_at)}: {n.content}" for n in store.topic_notes(t.id))
+    return f"# {t.name}\nSummary: {t.summary or '(none yet)'}\n\n{notes or '(no notes)'}"
 
 
-@app.patch("/api/topics/{topic_id}")
-def patch_topic(topic_id: int, body: TopicPatch):
-    if not db.get_topic(topic_id):
-        raise HTTPException(404, "no such topic")
-    db.update_topic(topic_id, name=body.name, summary=body.summary)
-    return topic_dict(db.get_topic(topic_id))
+@mcp.tool(title="Move note")
+def move_note(note_id: int, topic: str) -> str:
+    """Move a note that was filed under the wrong topic. Creates the topic if needed.
+
+    Args:
+        note_id: the number in square brackets
+        topic: the topic it belongs to
+    """
+    t = store.move_note(note_id, topic)
+    return f"Moved note [{note_id}] to '{t.name}'." if t else f"No note [{note_id}]."
 
 
-@app.post("/api/segments/{segment_id}/move")
-def move(segment_id: int, body: MoveIn):
-    try:
-        tid = engine.move_segment(segment_id, topic_id=body.topic_id, new_topic=body.new_topic)
-    except KeyError:
-        raise HTTPException(404, "no such segment")
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    return {"topic_id": tid, "topic_name": db.get_topic(tid).name}
+@mcp.tool(title="Merge topics")
+def merge_topics(source: str, target: str) -> str:
+    """Fold one topic into another when they turn out to be the same thing. Afterwards,
+    refresh the target's summary with update_summary.
+
+    Args:
+        source: topic to remove
+        target: topic that keeps all the notes
+    """
+    t = store.merge_topics(source, target)
+    return (f"Merged '{source}' into '{t.name}'. Refresh its summary." if t
+            else "Both topics must exist and be different.")
+
+
+@mcp.tool(title="Forget note", annotations=ToolAnnotations(destructiveHint=True))
+def forget(note_id: int) -> str:
+    """Delete a note. Only when the user asks you to forget something.
+
+    Args:
+        note_id: the number in square brackets
+    """
+    return f"Forgot note [{note_id}]." if store.delete_note(note_id) else f"No note [{note_id}]."
+
+
+def http_app():
+    app = mcp.streamable_http_app(stateless_http=True, json_response=True, host="0.0.0.0")
+    token = os.environ.get("AUTH_TOKEN")
+    if not token:
+        return app
+
+    async def guarded(scope, receive, send):
+        if scope["type"] == "http":
+            qs = dict(kv.split("=", 1) for kv in scope.get("query_string", b"").decode().split("&") if "=" in kv)
+            if qs.get("token") != token:
+                await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
+                return
+        await app(scope, receive, send)
+
+    return guarded
+
+
+if __name__ == "__main__":
+    if "--stdio" in sys.argv:
+        mcp.run("stdio")
+    else:
+        import uvicorn
+        uvicorn.run(http_app(), host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
