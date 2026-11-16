@@ -69,7 +69,7 @@ Then in Claude: Customize → Connectors → Add custom connector → `https://<
 | Variable | Default | |
 | --- | --- | --- |
 | `ONETHREAD_DB` | `./data/onethread.db` | SQLite file |
-| `EMBED_MODEL` | `hash` | built-in, no download. Set to `intfloat/multilingual-e5-small` (needs `sentence-transformers`) for semantic matching |
+| `EMBED_MODEL` | `auto` | uses `intfloat/multilingual-e5-small` if `sentence-transformers` is installed, else a built-in embedder with no download. Notes are re-embedded automatically when the model changes |
 | `AUTH_TOKEN` | unset | require `?token=` on the remote URL |
 | `PORT` | `8000` | |
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 
 import numpy as np
 
@@ -15,6 +16,7 @@ class HashEmbedder:
 
     # lexical overlap only, so the bar is low; Claude reads the topic index for the semantics
     recall_floor = 0.05
+    name = "hash"
 
     def __init__(self, dim: int = 1024):
         self.dim = dim
@@ -43,6 +45,7 @@ class STEmbedder:
 
         self.model = SentenceTransformer(model_name)
         self.prefix = "query: " if "e5" in model_name else ""
+        self.name = model_name
 
     def embed(self, text: str) -> np.ndarray:
         v = self.model.encode(self.prefix + text, normalize_embeddings=True)
@@ -50,13 +53,21 @@ class STEmbedder:
 
 
 def make_embedder():
-    name = os.environ.get("EMBED_MODEL", "hash")
+    """EMBED_MODEL=auto (default): use the multilingual model if sentence-transformers is
+    installed, otherwise the built-in hash embedder. 'hash' or a model name forces one."""
+    name = os.environ.get("EMBED_MODEL", "auto")
     if name == "hash":
         return HashEmbedder()
+    if name == "auto":
+        try:
+            import sentence_transformers  # noqa: F401
+        except ImportError:
+            return HashEmbedder()
+        name = "intfloat/multilingual-e5-small"
     try:
         return STEmbedder(name)
     except Exception as e:  # no package or no network: fall back so the app still runs
-        print(f"[onethread] embedding model '{name}' unavailable ({e}); using hash embedder")
+        print(f"[onethread] embedding model '{name}' unavailable ({e}); using hash embedder", file=sys.stderr)
         return HashEmbedder()
 
 

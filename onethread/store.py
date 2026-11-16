@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,10 @@ CREATE TABLE IF NOT EXISTS notes (
     created_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_notes_topic ON notes(topic_id);
+CREATE TABLE IF NOT EXISTS meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
 """
 
 
@@ -59,6 +64,26 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
         self.embedder = embedder
+        self._sync_embeddings()
+
+    def _sync_embeddings(self):
+        """Vectors from different models can't be compared, so when the embedder changes,
+        recompute every note once and remember which model they belong to."""
+        current = getattr(self.embedder, "name", type(self.embedder).__name__)
+        row = self.conn.execute("SELECT value FROM meta WHERE key='embed_model'").fetchone()
+        stored = row["value"] if row else None
+        if stored == current:
+            return
+        rows = self.conn.execute(
+            "SELECT n.id, n.content, t.name FROM notes n JOIN topics t ON t.id = n.topic_id").fetchall()
+        for r in rows:
+            emb = self.embedder.embed(f"{r['name']}：{r['content']}")
+            self.conn.execute("UPDATE notes SET embedding=? WHERE id=?",
+                              (emb.astype(np.float32).tobytes(), r["id"]))
+        self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('embed_model', ?)", (current,))
+        self.conn.commit()
+        if rows and stored is not None:
+            print(f"[onethread] re-embedded {len(rows)} notes: {stored} -> {current}", file=sys.stderr, flush=True)
 
     # ---------------------------------------------------------------- topics
     def _topic(self, r) -> Topic:
