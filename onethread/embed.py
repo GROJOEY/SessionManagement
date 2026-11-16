@@ -5,31 +5,41 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sys
 
 import numpy as np
 
 
+# Function characters that match everywhere and say nothing about the topic.
+STOP_CHARS = set("的了是在有和与及或也就都而但我你他她它们这那个一不没很太把被给到对从为以于之其等"
+                 "年月日号吗呢吧啊呀么着过上下中里后前时会要能可想说做用好还再又才只已比更最")
+
+
 class HashEmbedder:
-    """Bag of character 1-3 grams hashed into a fixed vector. Crude but works
-    offline for Chinese and English; good enough to prove the pipeline."""
+    """Bag of character 1-3 grams hashed into a fixed vector. No download, works offline
+    for Chinese and English. Digits, punctuation and function characters are dropped so
+    that '80 公斤' and '2026 年' don't make unrelated notes look alike."""
 
     # lexical overlap only, so the bar is low; Claude reads the topic index for the semantics
-    recall_floor = 0.05
-    name = "hash"
+    recall_floor = 0.03
+    name = "hash-v2"
 
-    def __init__(self, dim: int = 1024):
+    def __init__(self, dim: int = 8192):
         self.dim = dim
 
     def embed(self, text: str) -> np.ndarray:
         v = np.zeros(self.dim, dtype=np.float32)
-        t = text.lower()
+        t = re.sub(r"[\d\s\W_]+", " ", text.lower())
         for n in (1, 2, 3):
             for i in range(len(t) - n + 1):
                 gram = t[i : i + n]
-                if gram.strip():
-                    h = int(hashlib.md5(gram.encode()).hexdigest(), 16)
-                    v[h % self.dim] += 1.0 if n == 1 else 2.0
+                if " " in gram:
+                    continue
+                if n == 1 and (gram in STOP_CHARS or gram.isascii()):
+                    continue
+                h = int(hashlib.md5(gram.encode()).hexdigest(), 16)
+                v[h % self.dim] += 0.8 if n == 1 else 1.0
         norm = np.linalg.norm(v)
         return v / norm if norm else v
 
