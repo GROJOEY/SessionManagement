@@ -28,7 +28,8 @@ from starlette.responses import JSONResponse
 from .embed import make_embedder
 from .store import Store
 
-SUMMARY_EVERY = 5  # ask Claude to refresh a topic summary after this many new notes
+SUMMARY_EVERY = 5     # ask Claude to refresh a topic summary after this many new notes
+INDEX_WITH_GIST = 40  # recall's topic index: this many get a one-line summary, the rest names only
 
 store = Store(os.environ.get("ONETHREAD_DB", "./data/onethread.db"), make_embedder())
 
@@ -80,9 +81,14 @@ def recall(message: str) -> str:
     others = [t for t in store.list_topics() if t.id not in shown]
     if others:
         lines.append("## Other topics (call get_topic if one is relevant)")
-        for t in others[:40]:
+        # the most recently active get a one-line gist; the rest are listed by name only,
+        # which costs a few characters each, so Claude still knows every topic exists
+        for t in others[:INDEX_WITH_GIST]:
             gist = (t.summary or (store.topic_notes(t.id)[-1].content if t.note_count else ""))[:80]
             lines.append(f"- {t.name}: {gist}")
+        older = others[INDEX_WITH_GIST:]
+        if older:
+            lines.append("Older topics: " + ", ".join(t.name for t in older))
     if not lines:
         return "No memory yet. Anything worth keeping from this message starts a new topic."
     return "\n".join(lines).strip()
