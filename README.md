@@ -42,13 +42,18 @@ pip install -r requirements.txt
 {
   "mcpServers": {
     "onethread": {
-      "command": "python3",
+      "command": "/path/to/SessionManagement/.venv/bin/python",
       "args": ["-m", "onethread.server", "--stdio"],
-      "cwd": "/path/to/SessionManagement"
+      "env": {
+        "PYTHONPATH": "/path/to/SessionManagement",
+        "ONETHREAD_DB": "/path/to/SessionManagement/data/onethread.db"
+      }
     }
   }
 }
 ```
+
+Use absolute paths: the app doesn't start the server from the repo folder.
 
 For Claude Code: `claude mcp add onethread -- python3 -m onethread.server --stdio` from the repo folder.
 
