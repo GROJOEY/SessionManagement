@@ -1,0 +1,6 @@
+anthropic>=0.40
+fastapi
+uvicorn
+numpy
+# optional, better recall (downloads a ~470MB model on first run):
+# sentence-transformers
